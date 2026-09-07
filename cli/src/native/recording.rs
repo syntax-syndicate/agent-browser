@@ -332,20 +332,6 @@ struct ContactSheetCell {
     elapsed_ms: u64,
 }
 
-struct StoredContactSheetFrame {
-    image_data: Vec<u8>,
-    elapsed_ms: u64,
-}
-
-impl From<ContactSheetFrame> for StoredContactSheetFrame {
-    fn from(frame: ContactSheetFrame) -> Self {
-        Self {
-            image_data: frame.image_data,
-            elapsed_ms: frame.elapsed_ms,
-        }
-    }
-}
-
 struct ContactSheetBaseline {
     source: Arc<image::RgbImage>,
     preview: image::RgbImage,
@@ -353,10 +339,11 @@ struct ContactSheetBaseline {
 
 struct ContactSheetCollector {
     threshold: f64,
-    selected: Vec<StoredContactSheetFrame>,
+    selected: Vec<ContactSheetCell>,
     pending: Vec<ContactSheetFrame>,
     burst: bool,
     previous_candidate: Option<ContactSheetBaseline>,
+    previous_rendered: Option<Arc<image::RgbImage>>,
     latest: Option<ContactSheetFrame>,
     cell_height: Option<u32>,
 }
@@ -369,19 +356,31 @@ impl ContactSheetCollector {
             pending: Vec::new(),
             burst: false,
             previous_candidate: None,
+            previous_rendered: None,
             latest: None,
             cell_height: None,
         }
     }
 
+    fn commit_frame(&mut self, frame: ContactSheetFrame) {
+        if self.selected.len() >= MAX_CONTACT_SHEET_FRAMES - 1 {
+            return;
+        }
+        let cell = render_contact_cell(
+            &frame,
+            self.previous_rendered.as_deref(),
+            self.cell_height.unwrap_or(1),
+        );
+        self.previous_rendered = Some(frame.source.clone());
+        self.selected.push(cell);
+    }
+
     fn flush_pending(&mut self) {
         let remaining = (MAX_CONTACT_SHEET_FRAMES - 1).saturating_sub(self.selected.len());
-        self.selected.extend(
-            self.pending
-                .drain(..)
-                .take(remaining)
-                .map(StoredContactSheetFrame::from),
-        );
+        let pending = std::mem::take(&mut self.pending);
+        for frame in pending.into_iter().take(remaining) {
+            self.commit_frame(frame);
+        }
         self.burst = false;
     }
 
@@ -426,11 +425,8 @@ impl ContactSheetCollector {
         while self.pending.first().is_some_and(|first| {
             latest_ms.saturating_sub(first.elapsed_ms) > CONTACT_SHEET_BURST_WINDOW_MS
         }) {
-            if self.selected.len() < MAX_CONTACT_SHEET_FRAMES - 1 {
-                self.selected.push(self.pending.remove(0).into());
-            } else {
-                self.pending.remove(0);
-            }
+            let frame = self.pending.remove(0);
+            self.commit_frame(frame);
         }
 
         if self.pending.len() > CONTACT_SHEET_BURST_RATE {
@@ -498,7 +494,7 @@ impl ContactSheetCollector {
         self.latest = Some(frame);
     }
 
-    fn finish_frames(mut self) -> Vec<StoredContactSheetFrame> {
+    fn finish(mut self) -> Vec<ContactSheetCell> {
         self.flush_pending();
         if let Some(latest) = self.latest {
             let already_selected = self
@@ -506,33 +502,15 @@ impl ContactSheetCollector {
                 .last()
                 .is_some_and(|frame| frame.elapsed_ms == latest.elapsed_ms);
             if !already_selected {
-                self.selected.push(latest.into());
+                let cell = render_contact_cell(
+                    &latest,
+                    self.previous_rendered.as_deref(),
+                    self.cell_height.unwrap_or(1),
+                );
+                self.selected.push(cell);
             }
         }
         self.selected
-    }
-
-    fn finish(self) -> Vec<ContactSheetCell> {
-        let cell_height = self.cell_height.unwrap_or(1);
-        let frames = self.finish_frames();
-        let mut previous: Option<Arc<image::RgbImage>> = None;
-        frames
-            .into_iter()
-            .map(|stored| {
-                let source = image::load_from_memory(&stored.image_data)
-                    .expect("selected frame was decoded during selection")
-                    .into_rgb8();
-                let frame = ContactSheetFrame {
-                    source: Arc::new(source),
-                    image_data: stored.image_data,
-                    elapsed_ms: stored.elapsed_ms,
-                    change_ratio: 0.0,
-                };
-                let cell = render_contact_cell(&frame, previous.as_deref(), cell_height);
-                previous = Some(frame.source.clone());
-                cell
-            })
-            .collect()
     }
 }
 
@@ -1110,7 +1088,7 @@ async fn collect_frames(
     Ok(())
 }
 
-/// Analyze and render each candidate as it arrives on the blocking worker.
+/// Analyze frames and render finalized cells on the blocking worker.
 fn collect_contact_frames(
     frames: std::sync::mpsc::Receiver<CapturedVideoFrame>,
     threshold: f64,
@@ -1118,7 +1096,15 @@ fn collect_contact_frames(
     let mut collector = ContactSheetCollector::new(threshold);
     let mut max_lag = Duration::ZERO;
     let mut processed = 0u64;
-    for frame in frames {
+    loop {
+        let frame = match frames.recv_timeout(Duration::from_millis(CONTACT_SHEET_BURST_QUIET_MS)) {
+            Ok(frame) => frame,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                collector.flush_pending();
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         collector.consider(&frame.image_data, frame.elapsed);
         // Measure through completed selection/rendering, not just dequeue.
         let lag = frame.captured_at.elapsed();
@@ -1512,7 +1498,7 @@ mod tests {
         // A held frame ends the burst and must still become the final cell.
         collector.consider(&last_png, Duration::from_millis(1_300));
 
-        let frames = collector.finish_frames();
+        let frames = collector.finish();
         let timestamps = frames
             .iter()
             .map(|frame| frame.elapsed_ms)
@@ -1528,6 +1514,26 @@ mod tests {
                 >= 3,
             "the compacted scroll should retain representative middle frames"
         );
+    }
+
+    #[test]
+    fn test_contact_sheet_renders_finalized_cells_during_capture() {
+        let mut collector = ContactSheetCollector::new(0.01);
+        for (elapsed, color) in [(0, [0, 0, 0]), (300, [255, 255, 255])] {
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(100, 60, image::Rgb(color)))
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            collector.consider(&png, Duration::from_millis(elapsed));
+        }
+
+        assert_eq!(collector.selected.len(), 1);
+        assert_eq!(collector.selected[0].elapsed_ms, 0);
+        assert_eq!(
+            collector.selected[0].rendered.width(),
+            CONTACT_SHEET_CELL_WIDTH
+        );
+        assert_eq!(collector.pending.len(), 1);
     }
 
     #[test]
